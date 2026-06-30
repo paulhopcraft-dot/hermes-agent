@@ -62,6 +62,7 @@ const { registerUpdatesIpc } = require('./updates-ipc.cjs')
 const { registerLogsIpc } = require('./logs-ipc.cjs')
 const { registerProjectDirIpc } = require('./project-dir-ipc.cjs')
 const { registerVscodeThemeIpc } = require('./vscode-theme-ipc.cjs')
+const { registerUninstallIpc } = require('./uninstall-ipc.cjs')
 const { OFFICIAL_REPO_HTTPS_URL, isOfficialSshRemote } = require('./update-remote.cjs')
 const { resolveBehindCount, shouldCountCommits } = require('./update-count.cjs')
 const { runRebuildWithRetry } = require('./update-rebuild.cjs')
@@ -7127,11 +7128,8 @@ async function runDesktopUninstall(mode) {
   return { ok: true, mode, willRemoveAppBundle: Boolean(removeBundle), scriptPath }
 }
 
-ipcMain.handle('hermes:uninstall:summary', async () => getUninstallSummary())
-ipcMain.handle('hermes:uninstall:run', async (_event, payload) => {
-  const mode = payload && typeof payload === 'object' ? payload.mode : payload
-  return runDesktopUninstall(String(mode || ''))
-})
+// Uninstall IPC lives in uninstall-ipc.cjs; the uninstall engine is injected.
+registerUninstallIpc({ getUninstallSummary, ipcMain, runDesktopUninstall })
 
 // VS Code Marketplace theme IPC lives in vscode-theme-ipc.cjs.
 registerVscodeThemeIpc({ ipcMain })
