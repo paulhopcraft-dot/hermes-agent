@@ -6686,22 +6686,47 @@ def _codex_device_code_login() -> Dict[str, Any]:
     client_id = CODEX_OAUTH_CLIENT_ID
 
     # Step 1: Request device code
-    try:
-        with httpx.Client(timeout=httpx.Timeout(15.0)) as client:
-            resp = client.post(
-                f"{issuer}/api/accounts/deviceauth/usercode",
-                json={"client_id": client_id},
-                headers={"Content-Type": "application/json"},
-            )
-    except Exception as exc:
-        raise AuthError(
-            f"Failed to request device code: {exc}",
-            provider="openai-codex", code="device_code_request_failed",
-        )
+    resp = None
+    request_attempts = 0
+    max_request_attempts = 6
+    with httpx.Client(timeout=httpx.Timeout(15.0)) as client:
+        while request_attempts < max_request_attempts:
+            request_attempts += 1
+            try:
+                resp = client.post(
+                    f"{issuer}/api/accounts/deviceauth/usercode",
+                    json={"client_id": client_id},
+                    headers={"Content-Type": "application/json"},
+                )
+            except Exception as exc:
+                if request_attempts >= max_request_attempts:
+                    raise AuthError(
+                        f"Failed to request device code: {exc}",
+                        provider="openai-codex", code="device_code_request_failed",
+                    )
+                _time.sleep(min(5 * request_attempts, 30))
+                continue
 
-    if resp.status_code != 200:
+            if resp.status_code == 200:
+                break
+
+            if resp.status_code == 429 and request_attempts < max_request_attempts:
+                retry_after = resp.headers.get("Retry-After", "")
+                try:
+                    backoff = int(float(retry_after)) if retry_after else 5 * request_attempts
+                except Exception:
+                    backoff = 5 * request_attempts
+                _time.sleep(min(max(backoff, 5), 60))
+                continue
+
+            raise AuthError(
+                f"Device code request returned status {resp.status_code}.",
+                provider="openai-codex", code="device_code_request_error",
+            )
+
+    if resp is None or resp.status_code != 200:
         raise AuthError(
-            f"Device code request returned status {resp.status_code}.",
+            "Device code request failed without a valid response.",
             provider="openai-codex", code="device_code_request_error",
         )
 
@@ -6744,6 +6769,16 @@ def _codex_device_code_login() -> Dict[str, Any]:
                     break
                 elif poll_resp.status_code in {403, 404}:
                     continue  # User hasn't completed login yet
+                elif poll_resp.status_code == 429:
+                    # OpenAI may rate-limit polling if the user hasn't approved yet.
+                    # Treat this as a soft retry signal and back off before trying again.
+                    retry_after = poll_resp.headers.get("Retry-After", "")
+                    try:
+                        backoff = max(poll_interval, int(float(retry_after))) if retry_after else poll_interval
+                    except Exception:
+                        backoff = poll_interval
+                    _time.sleep(min(max(backoff, poll_interval * 2), 60))
+                    continue
                 else:
                     raise AuthError(
                         f"Device auth polling returned status {poll_resp.status_code}.",
