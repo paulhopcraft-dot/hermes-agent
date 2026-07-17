@@ -2640,6 +2640,39 @@ class TestAuxiliaryFallbackLayering:
         assert mock_openai.call_args.kwargs["api_key"] == "codex-oauth-token"
 
 
+class TestReadMainModel:
+    """_read_main_model reads model.default, falling back to model.model."""
+
+    def _read(self, config):
+        import agent.auxiliary_client as mod
+        with patch.object(mod, "_RUNTIME_MAIN_MODEL", ""), \
+             patch("hermes_cli.config.load_config", return_value=config):
+            return mod._read_main_model()
+
+    def test_reads_model_default(self):
+        assert self._read({"model": {"default": "gpt-5.3-codex"}}) == "gpt-5.3-codex"
+
+    def test_falls_back_to_model_model(self):
+        """Some ``hermes auth`` paths write model.model without model.default."""
+        assert self._read({"model": {"model": "gpt-5.3-codex"}}) == "gpt-5.3-codex"
+
+    def test_default_wins_over_model(self):
+        assert self._read(
+            {"model": {"default": "picked-model", "model": "auth-model"}}
+        ) == "picked-model"
+
+    def test_blank_default_falls_back_to_model(self):
+        assert self._read(
+            {"model": {"default": "  ", "model": "auth-model"}}
+        ) == "auth-model"
+
+    def test_string_model_cfg(self):
+        assert self._read({"model": "bare-model"}) == "bare-model"
+
+    def test_empty_config_returns_empty(self):
+        assert self._read({}) == ""
+
+
 class TestTryMainAgentModelFallback:
     """_try_main_agent_model_fallback resolves the user's main provider+model as a safety net."""
 
