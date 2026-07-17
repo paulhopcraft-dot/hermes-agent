@@ -185,6 +185,25 @@ Then set in `~/.hermes/.env`:
 CAMOFOX_URL=http://localhost:9377
 ```
 
+If Camofox is running in Docker and you want it to open web apps served from the host machine, enable loopback rewriting. `CAMOFOX_URL` should still point at the host-published control API, but page URLs such as `http://127.0.0.1:3000` must be opened from inside the container as `http://host.docker.internal:3000`:
+
+```yaml
+# ~/.hermes/config.yaml
+browser:
+  camofox:
+    rewrite_loopback_urls: true
+    loopback_host_alias: host.docker.internal  # default; use a LAN IP if needed
+```
+
+Equivalent env vars:
+
+```bash
+CAMOFOX_REWRITE_LOOPBACK_URLS=true
+CAMOFOX_LOOPBACK_HOST_ALIAS=host.docker.internal
+```
+
+The rewrite only applies to page navigation URLs with loopback hosts (`localhost`, `127.0.0.1`, `::1`). It does not change `CAMOFOX_URL`. Leave it disabled for non-Docker Camofox installs, where the browser already runs on the host and loopback URLs are correct.
+
 Or configure via `hermes tools` → Browser Automation → Camofox.
 
 When `CAMOFOX_URL` is set, all browser tools automatically route through Camofox instead of Browserbase or agent-browser.
@@ -376,9 +395,9 @@ BROWSERBASE_ADVANCED_STEALTH=false
 # Session reconnection after disconnects — requires paid plan (default: "true")
 BROWSERBASE_KEEP_ALIVE=true
 
-# Custom session timeout in milliseconds (default: project default)
-# Examples: 600000 (10min), 1800000 (30min)
-BROWSERBASE_SESSION_TIMEOUT=600000
+# Custom session timeout in seconds (max 21600 = 6 hours) (default: project default)
+# Examples: 600 (10min), 1800 (30min), 21600 (6h max)
+BROWSERBASE_SESSION_TIMEOUT=1800
 
 # Inactivity timeout before auto-cleanup in seconds (default: 120)
 BROWSER_INACTIVITY_TIMEOUT=120
@@ -424,7 +443,7 @@ Get a text-based snapshot of the current page's accessibility tree. Returns inte
 - **`full=false`** (default): Compact view showing only interactive elements
 - **`full=true`**: Complete page content
 
-Snapshots over 8000 characters are automatically summarized by an LLM.
+Snapshots over 15,000 characters are automatically truncated or summarized by an LLM (the same per-page budget as `web_extract`). When that happens, the complete snapshot is saved to `~/.hermes/cache/web/` and the tool output includes the file path plus a ready-to-use `read_file` call, so the agent can page through the full accessibility tree — including element refs beyond the cut — without re-snapshotting.
 
 ### `browser_click`
 
@@ -498,6 +517,8 @@ browser_console(expression="JSON.stringify(performance.timing)")
 ```
 
 When a CDP supervisor is active for the current session (typical for any session that's run `browser_navigate` against a CDP-capable backend), evaluation runs over the supervisor's persistent WebSocket — no subprocess startup cost. Falls through to the standard agent-browser CLI path otherwise. Behaviour is identical either way; only latency changes.
+
+Evaluation is unrestricted by default — the agent can use `fetch`, read storage, query form values, and run any DOM extraction. Requests targeting private/internal addresses are still blocked on non-local backends (the SSRF guard is independent of this setting). If you browse hostile pages with a logged-in profile and want a strict denylist over sensitive JS primitives (cookies, storage, clipboard, network calls, form values), opt in with `browser.restrict_evaluate: true` in `config.yaml`. Note the denylist matches primitive *names*, so it also blocks legitimate expressions that merely contain words like `fetch` or `cookie`.
 
 ### `browser_cdp`
 
@@ -636,7 +657,7 @@ If paid features aren't available on your plan, Hermes automatically falls back 
 ## Limitations
 
 - **Text-based interaction** — relies on accessibility tree, not pixel coordinates
-- **Snapshot size** — large pages may be truncated or LLM-summarized at 8000 characters
+- **Snapshot size** — large pages may be truncated or LLM-summarized at 15,000 characters (matching `web_extract`); the complete snapshot is saved to `~/.hermes/cache/web/` and the output points at it for `read_file` paging
 - **Session timeout** — cloud sessions expire based on your provider's plan settings
 - **Cost** — cloud sessions consume provider credits; sessions are automatically cleaned up when the conversation ends or after inactivity. Use `/browser connect` for free local browsing.
 - **No file downloads** — cannot download files from the browser

@@ -66,6 +66,16 @@ def test_anthropic_oauth_json_blocked(fake_home):
     assert "credential store" in err
 
 
+def test_google_oauth_json_blocked(fake_home):
+    """Gemini OAuth tokens live under auth/google_oauth.json — blocked."""
+    from agent.file_safety import get_read_block_error
+
+    oauth = _create(fake_home, Path("auth") / "google_oauth.json")
+    err = get_read_block_error(str(oauth))
+    assert err is not None
+    assert "credential store" in err
+
+
 def test_arbitrary_hermes_home_file_not_blocked(fake_home):
     """Non-credential files inside HERMES_HOME stay readable."""
     from agent.file_safety import get_read_block_error
@@ -134,6 +144,7 @@ def test_read_file_tool_blocks_relative_path_under_terminal_cwd(
     import json
 
     import tools.file_tools as ft
+    import tools.terminal_tool as terminal_tool
 
     _create(fake_home, "auth.json")
     # Force the file_tools resolver to anchor relative paths at HERMES_HOME
@@ -141,12 +152,138 @@ def test_read_file_tool_blocks_relative_path_under_terminal_cwd(
     monkeypatch.setenv("TERMINAL_CWD", str(fake_home))
     monkeypatch.chdir(tmp_path)
     monkeypatch.setattr(
-        ft, "_get_live_tracking_cwd", lambda task_id="default": None
+        terminal_tool, "_session_cwd", {}
     )
 
     out = json.loads(ft.read_file_tool("auth.json"))
     assert "error" in out
     assert "credential store" in out["error"]
+
+
+def test_read_file_tool_blocks_nested_google_oauth_path(
+    fake_home, tmp_path, monkeypatch
+):
+    """The real read_file tool must not return Gemini OAuth token material."""
+    import json
+
+    import tools.file_tools as ft
+    import tools.terminal_tool as terminal_tool
+
+    oauth = _create(fake_home, Path("auth") / "google_oauth.json")
+    oauth.write_text(
+        json.dumps(
+            {
+                "refresh": "REFRESH_TOKEN_MARKER",
+                "access": "ACCESS_TOKEN_MARKER",
+                "email": "user@example.com",
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(
+        terminal_tool, "_session_cwd", {}
+    )
+
+    out = json.loads(ft.read_file_tool(str(oauth), task_id="google-oauth-test"))
+    assert "error" in out
+    assert "credential store" in out["error"]
+    assert "REFRESH_TOKEN_MARKER" not in json.dumps(out)
+    assert "ACCESS_TOKEN_MARKER" not in json.dumps(out)
+
+
+def test_search_tool_blocks_direct_auth_json_path(fake_home, monkeypatch):
+    """Searching a credential file directly must not invoke the search backend."""
+    import json
+
+    import tools.file_tools as ft
+    import tools.terminal_tool as terminal_tool
+
+    auth = _create(fake_home, "auth.json")
+    auth.write_text("SEARCH_DIRECT_AUTH_SECRET", encoding="utf-8")
+
+    def fail_if_called(task_id="default"):
+        raise AssertionError("search backend should not run for blocked path")
+
+    monkeypatch.setattr(ft, "_get_file_ops", fail_if_called)
+
+    out = json.loads(
+        ft.search_tool(
+            pattern="SEARCH_DIRECT_AUTH_SECRET",
+            path=str(auth),
+            task_id="search-direct-auth-json",
+        )
+    )
+    raw = json.dumps(out)
+    assert "error" in out
+    assert "credential store" in out["error"]
+    assert "SEARCH_DIRECT_AUTH_SECRET" not in raw
+
+
+def test_search_tool_filters_credential_results(fake_home, tmp_path, monkeypatch):
+    """Directory searches omit credential and MCP-token result entries."""
+    import json
+
+    from tools.file_operations import SearchMatch, SearchResult
+    import tools.file_tools as ft
+    import tools.terminal_tool as terminal_tool
+
+    auth = _create(fake_home, "auth.json")
+    token = _create(fake_home, Path("mcp-tokens") / "provider.json")
+    safe = _create(fake_home, "notes.txt")
+
+    class FakeFileOps:
+        def search(self, **kwargs):
+            return SearchResult(
+                matches=[
+                    SearchMatch(
+                        path=str(auth),
+                        line_number=1,
+                        content="SEARCH_AUTH_SECRET",
+                    ),
+                    SearchMatch(
+                        path=str(token),
+                        line_number=1,
+                        content="SEARCH_MCP_SECRET",
+                    ),
+                    SearchMatch(
+                        path=str(safe),
+                        line_number=1,
+                        content="public note",
+                    ),
+                ],
+                files=[str(auth), str(token), str(safe)],
+                total_count=5,
+                truncated=True,
+            )
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(ft, "_get_file_ops", lambda task_id="default": FakeFileOps())
+    monkeypatch.setattr(
+        terminal_tool, "_session_cwd", {}
+    )
+
+    search_response = ft.search_tool(
+        pattern="SEARCH",
+        path=str(fake_home),
+        task_id="search-filter-credentials",
+    )
+    out = json.loads(search_response.split("\n\n[Hint:", 1)[0])
+    raw = json.dumps(out)
+    returned_paths = {
+        match["path"] for match in out.get("matches", [])
+    } | set(out.get("files", []))
+
+    assert "SEARCH_AUTH_SECRET" not in raw
+    assert "SEARCH_MCP_SECRET" not in raw
+    assert str(auth) not in returned_paths
+    assert str(token) not in returned_paths
+    assert "public note" in raw
+    assert str(safe) in returned_paths
+    assert out["_omitted"].startswith("4 result(s) omitted")
+    assert out["total_count"] == 5
+    assert out["truncated"] is True
+    assert "[Hint: Results truncated." in search_response
 
 
 # ---------------------------------------------------------------------------
@@ -205,28 +342,43 @@ def test_mcp_tokens_dir_itself_blocked(fake_home):
     assert "MCP token" in err
 
 
-def test_identically_named_files_outside_hermes_home_not_blocked(
+def test_identically_named_hermes_files_outside_home_not_blocked(
     fake_home, tmp_path
 ):
-    """A project's ``.env``, ``auth.json``, or ``mcp-tokens/`` outside
-    HERMES_HOME must remain readable — the gate is per-location, not
-    per-filename."""
+    """Hermes-specific filenames (``auth.json``, ``mcp-tokens/``, ``google_oauth.json``)
+    outside HERMES_HOME must remain readable — the gate is per-location for
+    those, not per-filename. ``.env`` is the exception: it's blocked anywhere
+    on disk (see test_project_local_env_blocked) because the basename always
+    means \"secret-bearing environment file\" regardless of directory."""
     from agent.file_safety import get_read_block_error
 
     project = tmp_path / "myproject"
     project.mkdir()
-    for rel in (".env", "auth.json"):
-        p = project / rel
-        p.write_text("not secret here", encoding="utf-8")
-        assert get_read_block_error(str(p)) is None, (
-            f"{rel} outside HERMES_HOME should NOT be blocked"
-        )
+    # auth.json outside HERMES_HOME — readable (per-location gate).
+    p = project / "auth.json"
+    p.write_text("not secret here", encoding="utf-8")
+    assert get_read_block_error(str(p)) is None, (
+        "auth.json outside HERMES_HOME should NOT be blocked"
+    )
+
+    google_oauth = project / "auth" / "google_oauth.json"
+    google_oauth.parent.mkdir()
+    google_oauth.write_text("not really a token", encoding="utf-8")
+    assert get_read_block_error(str(google_oauth)) is None
 
     tokens = project / "mcp-tokens"
     tokens.mkdir()
     tok_file = tokens / "token.json"
     tok_file.write_text("not really a token", encoding="utf-8")
     assert get_read_block_error(str(tok_file)) is None
+
+
+def test_non_secret_auth_subtree_file_not_blocked(fake_home):
+    """Only the known Google OAuth token path is blocked, not all auth/*."""
+    from agent.file_safety import get_read_block_error
+
+    note = _create(fake_home, Path("auth") / "notes.json")
+    assert get_read_block_error(str(note)) is None
 
 
 def test_config_yaml_not_blocked(fake_home):
@@ -267,6 +419,14 @@ def test_profile_mode_blocks_root_credentials(tmp_path, monkeypatch):
     root_env = root / ".env"
     root_env.write_text("x")
     assert "credential store" in (get_read_block_error(str(root_env)) or "")
+
+    # Root-level Google OAuth token store: blocked too
+    root_google_oauth = root / "auth" / "google_oauth.json"
+    root_google_oauth.parent.mkdir(parents=True, exist_ok=True)
+    root_google_oauth.write_text("x")
+    assert "credential store" in (
+        get_read_block_error(str(root_google_oauth)) or ""
+    )
 
     # Root-level mcp-tokens: blocked
     root_tok = root / "mcp-tokens" / "gh.json"
